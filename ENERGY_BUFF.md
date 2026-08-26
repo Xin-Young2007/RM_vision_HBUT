@@ -6,7 +6,7 @@
 HWauto_buff2026 融合实现，推理用 onnxruntime CPU（本机无 NVIDIA GPU），
 新增 buff_detector 节点完成全链路，输出复用装甲板 Target.msg，云台侧零改动。
 
-**2026 规则的正确理解（打之前要懂）**：
+**2026 规则要点**：
 - 能量机关中心是 **R 字标志**（只用于观测定位，**不是打击目标**）
 - **5 个发光靶子（装甲模块）绕 R 旋转**，打靶子（靶心 = 装甲模块中心），R 只是参照物
 - 浙大 0.7m 的思路：从 R 中心沿半径延伸 0.7m，正好到靶子附近
@@ -21,7 +21,7 @@ HWauto_buff2026 融合实现，推理用 onnxruntime CPU（本机无 NVIDIA GPU�
                 → control/gimbal_control → lc_serial → 电控
 ```
 
-**两个打击点的区别（看调试图必懂）**：
+**两个打击点的区别**：
 
 | 点 | 含义 | 用途 |
 | --- | --- | --- |
@@ -78,39 +78,84 @@ cd src/rm_auto_aim/buff_detector
 
 ## 四、实车使用
 
-### 1. 一条命令
+### 1. 兵种协议区分（先搞清楚再上车）
+
+视觉侧为**同一套自瞄工程**（本工程），英雄/步兵与哨兵仅串口协议不同，
+通过 `serial_protocol` 参数区分，电控侧接收协议与视觉侧一一对应：
+
+| 兵种 | serial_protocol | 串口节点 | 电控协议 |
+| --- | --- | --- | --- |
+| 英雄 / 步兵 | `cjson`（默认） | lc_serial | CJSON 文本，115200 |
+| 哨兵 | `binary` | lc_rm_serial | 二进制帧（0xA5 头 + CRC16），921600 |
+
+协议不匹配时电控无法解析，云台不动或乱动。上车前确认对应兵种的电控程序，
+启动时带对应参数。同一台车换兵种使用时，只改这个参数即可。
+
+### 2. 启动
 
 ```bash
+# 英雄 / 步兵
 ros2 launch bringup energy_real_launch.py
-# 小符                ros2 launch bringup energy_real_launch.py buff_mode:=1
-# 哨兵（二进制协议）    ros2 launch bringup energy_real_launch.py serial_protocol:=binary
+# 哨兵
+ros2 launch bringup energy_real_launch.py serial_protocol:=binary
+# 小符（大符为默认）
+ros2 launch bringup energy_real_launch.py buff_mode:=1
 ```
 
-energy_real_launch.py 自动组装：mv_camera + buff_detector（零拷贝）+ gimbal_controller + lc_serial + tf。
-**实车默认**：大符、打红符（buff_color=1，蓝队打红符）、浙大模型、odom 系跟踪。
+energy_real_launch.py 自动组装：mv_camera + buff_detector（零拷贝）+
+gimbal_controller + 对应协议串口节点 + robot_state_publisher（tf）。
+实车默认参数：大符、打红符（buff_color=1，蓝队打红符）、浙大模型、odom 系跟踪。
 
-### 2. 上车前改 3 处参数（params.yaml）
+### 3. 硬件连接
 
-| 参数 | 改成 | 为什么 |
-| --- | --- | --- |
-| /mv_camera.camera_info_url | 你们相机+镜头的标定文件 | 内参错 PnP 全错，不可能是浙大给的 |
-| /lc_serial_driver.device_name | 实际串口（ls /dev/ttyACM*） | 串口不通云台不动 |
-| /gimbal_controller.shoot_speed | 实车弹速（打靶标定） | 弹速错打偏 |
+1. 电控上电（云台供电独立于 USB）
+2. 相机 USB 线接电脑（海康相机，驱动随系统分发）
+3. 串口线接电脑，确认电控侧接口
 
-### 3. 兵种协议（serial_protocol）
+接头检查：`ls /dev/ttyACM*`（或 ttyUSB*），记下实际设备名。
+串口设备名与 USB 口位置相关，固定插同一个口可保持稳定。
 
-- `cjson`（默认）：普通兵种，lc_serial，CJSON 文本 115200
-- `binary`：哨兵，lc_rm_serial，二进制帧 921600+CRC16
-**必须和电控烧的程序一致**，问电控组长，别猜。
+### 4. 启动前参数确认（params.yaml）
 
-### 4. 无弹联调 → 实弹（顺序不能乱）
+| 参数 | 确认内容 |
+| --- | --- |
+| /mv_camera.camera_info_url | 指向当前相机+镜头的标定文件（学长已标定，确认是该文件） |
+| /lc_serial_driver.device_name | 与实际串口设备名一致 |
+| /gimbal_controller.shoot_speed | 先按已知弹速填写，后续打靶标定 |
 
-1. 电控侧关发射（拔发射机构/保险）
-2. 启动后依次验证：
-   - `ros2 topic echo /gimbal_feed` 有数据且在变（电控在回角度，串口双向通）
-   - `ros2 run tf2_tools view_frames` 树完整；手转云台 rviz 里相机系跟着动
-   - 云台自动跟符、`/debug/controller` 里 target_yaw2real_error 趋近 0、is_fire 变 1
-3. 全链路正常后实弹：先单发打点 → 调 shoot_speed / buff_radius → 再连发
+### 5. 通信验证（启动后第一步）
+
+```bash
+ros2 topic echo /gimbal_feed
+```
+
+- 通过：有数据且数值在变化，说明电控在回传 IMU 角度，串口双向通
+- 无数据排查顺序：设备名 → 串口权限（usermod -aG dialout）→ 协议不匹配 → 电控上电状态
+- 手转云台，确认 /gimbal_feed 中对应角度跟随变化（核对方向约定）
+
+### 6. 无弹联调（关发射机构/保险后运行）
+
+启动后按以下次序确认，全部通过再进入实弹：
+
+1. `ros2 run tf2_tools view_frames`：odom←gimbal←camera 树完整；
+   手动转动云台时 rviz 中相机坐标系跟随
+2. `ros2 topic echo /tracker/target`：检测到符后 tracking=true、position 数值合理
+3. 云台自动跟踪扇叶；`/debug/controller` 中 target_yaw2real_error 收敛、
+   is_fire 随目标进入开火窗口置 1
+
+### 7. 实弹标定
+
+1. 单发点射，记录弹着点
+2. 根据弹着点偏差调整参数，重复单发直至命中：
+
+| 弹着点现象 | 调整 |
+| --- | --- |
+| 沿目标运动方向前后偏 | shoot_speed / shoot_delay 标定 |
+| 上下偏 | 标定文件或相机安装角度 |
+| 固定方向恒定偏 | buff_radius（量测 R 中心到靶子实际距离） |
+| 时准时不准 | 检查黄圈（预测击打点）稳定性，RANSAC 拟合参数 |
+
+3. 弹速标定完成后再连发
 
 ## 五、参数表（buff_detector_node）
 
@@ -157,7 +202,7 @@ energy_real_launch.py 自动组装：mv_camera + buff_detector（零拷贝）+ g
 **当前为主**：
 - 全链路：检测（zju/szu 可选）→ 筛选 → PnP → tf → 跟踪（小符 KF/大符 RANSAC）→ 预测 → 发布 Target
 - 双点：position=目标打击点（gimbal 用），predictive_point=预测击打点（新字段，云台暂未消费）
-- 主链路提前量：**保持浙大原版**（buff 发当前点+切向速度，云台弹道解算+直线外推统一算）——别改回"buff 外推弹道"，飞行时间两处不一致会引入误差（试过已回退）
+- 主链路提前量：**保持浙大原版**（buff 发当前点+切向速度，云台弹道解算+直线外推统一算）——不建议改回 buff 侧外推：飞行时间两处不一致会引入误差（已试并回退）
 
 **近期改动**：
 - tf 查询用图像时间戳（云台转动时位姿正确）
@@ -169,7 +214,7 @@ energy_real_launch.py 自动组装：mv_camera + buff_detector（零拷贝）+ g
 - Target.msg 增加 predictive_point 字段
 - 四个 launch 支持 detector_format 切换、实车支持 serial_protocol
 
-**已放弃的（别重复踩）**：
+**已进行并回退的尝试**：
 - R 中心关键点逐帧修正位姿（把黄圈拉飞，已删除）
 - 打击点改为 R 中心（R 只是标志，不是靶心，用户确认）
 - onnxruntime 多线程/图优化（实测更慢）
