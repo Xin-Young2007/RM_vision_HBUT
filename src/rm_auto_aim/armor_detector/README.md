@@ -50,8 +50,8 @@ ros2 run armor_detector armor_detector_node --ros-args -p detector_mode:=neural
 | `neural_model_path` | 空 → `model/shenzhen-0526.onnx` | 模型路径，换成 `0708.onnx` 也能跑（输入 dtype 自动识别） |
 | `neural_conf_threshold` | 0.65 | 置信度阈值，远距离误识别多就调高，漏检多就调低（0.5~0.6） |
 | `neural_nms_threshold` | 0.45 | NMS 的 IoU 阈值，同一个板子出多个框就调小 |
-| `neural_refine_with_traditional` | true | 是否用传统灯条 PCA 角点微调 CNN 角点（融合的关键） |
-| `neural_fallback_traditional` | true | CNN 这一帧啥也没检出时，是否整帧退回传统流程 |
+| `neural_refine_with_traditional` | **false** | 是否额外跑一遍传统找灯条来精修网络角点。**默认关**：网络四点直接进 PnP（同济/南理工/深大都是这个路子）；只在想对比角点精度时打开，打开后每帧多约 1.1ms |
+| `neural_fallback_traditional` | true | 神经网络这一帧**没用**（没检出/推理失败）时，本帧退回传统识别兜底。它是惰性的：网络正常出结果时传统流程一行都不跑 |
 | `neural_swap_color` | false | 红蓝对调。实测 0526 模型第 9 列是蓝、第 10 列是红；实车若发现颜色反了打开这个开关 |
 
 `detect_color`（0 蓝 1 红）、`ignore_classes`、`debug`、`binary_thres` 这几个老参数在两种模式下都有效。
@@ -93,20 +93,21 @@ ros2 run armor_detector armor_detector_node --ros-args -p detector_mode:=neural
 
 预处理与深大原版部署保持一致：整幅图**直接拉伸**到 640x640（不做 letterbox，实测两者精度相当，拉伸与原版一致）。
 
-## 4. 神经网络模式做了什么（融合思路）
+## 4. 神经网络模式做了什么
 
-1. **神经网络**：一帧推理给出装甲板候选 + 四个角点 + 颜色 + 编号，解决“是什么”和传统视觉难处理的误识别（灯条粘连、远处糊成一团）。
-2. **传统视觉**：同一帧照常找灯条（二值化 + PCA + 梯度找端点），拿到亚像素级的灯条端点。对每个 CNN 灯条，按中心距离 / 倾角 / 长度比找最近的同一条灯条，用它的端点替换 CNN 回归出来的角点 → PnP 更稳。
-   - 匹配阈值、装甲板宽度回退保护见 `RefineParams`，配错灯条会整体回退，不会让位姿飞掉。
-   - CNN 原始角点保留在 `light.pca_top / light.pca_bottom`，调试图像里画成**黄色**，融合后的角点画成**绿色**，一眼能看出融合起没起作用。
-3. **兜底**：CNN 这一帧一个板子都没检出时，整帧退回传统流程（含 MLP 分类），避免神经网络抖动导致丢帧。
-4. 关掉 2、3 就是“纯神经网络模式”：
-   ```bash
-   ros2 param set /armor_detector neural_refine_with_traditional false
-   ros2 param set /armor_detector neural_fallback_traditional false
-   ```
+一条直线，中间不做传统视觉：
 
-调试话题和传统模式共用：`/detector/result_img`、`/detector/number_img`、`/detector/binary_img`（二值图在神经网络模式下只有跑了传统流程的那一帧才发布）、`/detector/debug_lights`、`/detector/debug_armors`。
+```
+神经网络（四点 + 颜色 + 编号）→ PnP(SOLVEPNP_IPPE) → optimizeYaw(重投影优化) → tracker(EKF) → 火控
+```
+
+1. **神经网络**：一帧推理直接给出装甲板四个角点、颜色、编号（`neural_detector.cpp` 解码 22 列）。
+2. **角点不做传统精修**：四点原样交给 `PnPSolver`，和传统模式共用同一个 PnP + yaw 优化（`optimizeYaw` 是微秒级的重投影优化，不占 CPU）。这是同济 sp_vision_25、南理工 Alliance、深大 RobotPilots 的通行做法，调研见第 9 节。
+   - 想对比"网络角点 vs 传统灯条精修角点"时，把 `neural_refine_with_traditional` 打开即可（默认关），调试图上黄点=网络角点、绿框=精修后角点。
+3. **兜底是惰性的**：只有神经网络这一帧**没用**（没检出，或推理抛异常，或模型压根加载不上）才跑传统识别那一套；网络正常出结果的帧，传统流程一行都不执行。连续兜底会打 WARN 日志提示"正在用传统识别兜底"。
+4. 第 2 步默认关掉之后，神经网络模式每帧的 CPU 开销就只有：预处理 + 推理 + 解码 + NMS + PnP。
+
+调试话题和传统模式共用：`/detector/result_img`、`/detector/number_img`（仅 debug 打开时生成）、`/detector/binary_img`、`/detector/debug_lights`、`/detector/debug_armors`（后三个在神经网络模式下只有跑了传统兜底的那一帧才发布）。
 
 ## 5. 实测记录（2026-09 离线 + 话题联调）
 
@@ -115,11 +116,25 @@ ros2 run armor_detector armor_detector_node --ros-args -p detector_mode:=neural
 | 列语义核对 | 蓝方 3 号装甲板 → 第 9 列（蓝）最大、类别序号 3；`model_infer_example.jpg` 上 4 号板 → 类别序号 4。模型作者文档写的“红蓝灰紫”与实测相反，**以实测为准**（`neural_swap_color` 就是留给这个的保险） |
 | 精度 | 深大官方示例图 1440x720：2 个装甲板全部检出，置信度 0.957 / 0.858 |
 | 本队远距离图 | `doc/截图 2026-03-10 12-57-13.png`（8mm，4~5m）蓝色 3 号：置信度 0.933 |
-| 速度 | 本机 i7-13650HX（20 线程，CPU）：单帧推理 **11.5~13ms**（引用进 640x640），整链路 FPS 还受视频源限制 |
-| 话题联调 | `video_pub` 播测试视频 + `armor_detector`：在线切 `neural` 后 `/detector/armors` 正常输出 `number: '3' / type: small` 和 PnP 位姿，切回 `traditional` 正常 |
-| 传统模式 | 代码路径未改动，两种模式下 `/detector/*` 调试话题都在 |
-| 实车视频（小陀螺） | `blue_rotate_fast.mp4`（1280x1024@60，3813 帧）与 `red_rotate_fast.mp4`（3056 帧）：**每一帧都检出**，蓝 5933 个板 / 红 4758 个板，编号全部正确为 `3`，平均推理 10.9 / 11.3ms |
-| 同视频 A/B（蓝方） | 传统模式 100% 帧有检出、1.04 个/帧、处理 34FPS；神经网络模式 100% 帧有检出、**1.55 个/帧**、处理 42FPS —— 快到小陀螺转过侧面那块板时，传统配对规则会漏掉，神经网络补上了 |
+| 实车视频（小陀螺） | `blue_rotate_fast.mp4`（1280x1024@60，3813 帧）与 `red_rotate_fast.mp4`（3056 帧）：**每一帧都检出**，蓝 5933 个板 / 红 4758 个板，编号全部正确为 `3` |
+| 话题联调 | 在线切 `neural` 后 `/detector/armors` 正常输出 `number: '3' / type: small` 和 PnP 位姿；切回 `traditional` 正常 |
+| 兜底验证 | 把 `neural_conf_threshold` 抬到 0.99 逼神经网络"用不了"，`/detector/armors` 仍由传统识别给出结果，日志出现"神经网络连续 N 帧没有可用结果，用传统识别兜底" |
+| 检出数对比（同视频） | 传统模式 100% 帧有检出、1.06 个/帧；神经网络 100% 帧有检出、**1.57 个/帧** —— 小陀螺转过侧面那块板传统配对规则会漏，神经网络补上了 |
+
+### 每帧 CPU 开销实测（i7-13650HX，1280x1024 真机视频帧）
+
+| 阶段 | 耗时 |
+| --- | --- |
+| 神经网络推理（onnxruntime **CPU** 版） | **11.0 ms** |
+| 神经网络预处理 + 解码（resize 0.19 + 归一化 1.44 + 解码/NMS/建 Armor） | 2.7 ms |
+| 传统：二值化 + 找灯条（neural 模式下每帧跑的那部分） | 1.14 ms |
+| 传统：完整 `detect()`（含灯条配对 + MLP 数字分类） | 1.15 ms |
+
+结论（和当初的猜测不一样，按实测来）：
+
+- **"传统那步很贵"在 neural 模式下并不成立**：neural 路径里每帧跑的传统部分只有 ~1.1ms，去掉它省不下多少；真正的大头是 **onnxruntime 跑在 CPU 上（11ms）**，GPU 完全没用上。
+- 传统模式之所以慢，主要贵在灯条配对 + MLP 数字分类那一套，而不是找灯条本身。
+- 所以下一步该动的是推理后端（OpenVINO GPU / TensorRT），不是继续抠预处理（`blobFromImage + convertTo(fp16)` 只能把 1.44ms 降到 1.10ms）。
 
 ## 6. 离线测试程序
 
@@ -135,9 +150,12 @@ cd install/armor_detector/lib/armor_detector
 
 # 视频：会统计检出帧数、装甲板总数、平均推理耗时
 ./test_neural_detector /path/armor.avi "" /tmp/out.avi
+
+# 想看"网络角点 vs 传统灯条精修角点"的差别，加 --refine（默认不加，和运行时一致）
+./test_neural_detector /path/armor.jpg /path/shenzhen-0526.onnx /tmp/out.jpg --refine
 ```
 
-输出里会同时打印 **CNN 角点** 和 **融合角点**，可以直接对比融合前后差多少像素；结果图上黄点=CNN 角点，绿框=最终交给 PnP 的角点。
+不加 `--refine` 时程序只跑神经网络，打印的是纯网络四点；加了之后会额外跑一遍传统找灯条，把 CNN 角点和精修角点并排打印出来，结果图上黄点=网络角点、绿框=精修后角点，能直接看出差几像素。
 
 ### 用实车视频看效果（一条命令，自动开看图窗口）
 
@@ -215,8 +233,27 @@ python3 src/rm_auto_aim/armor_detector/tools/ab_compare.py
 - **颜色反了**：`ros2 param set /armor_detector neural_swap_color true`。
 - **远距离误识别多**：`neural_conf_threshold` 调到 0.75~0.85（深大自己的建议也是哨兵把阈值调高）；也可以按类别屏蔽，例如 `ignore_classes: ["base"]`。
 - **一个板子出好几个框**：`neural_nms_threshold` 从 0.45 调到 0.3。
-- **数字偶尔跳**（比如 3/4 之间跳）：tracker 是按 `number` 匹配的，跳变会导致重新锁定；可以先调高置信度阈值，再考虑只用神经网络给颜色、编号仍用 MLP（把 `neural_refine_with_traditional` 保持 true，编号逻辑在 `neural_detector.cpp` 的 `kGenres` 表旁边）。
-- **帧率掉**：CPU 推理 12ms 左右，肉眼无感；如果整机吃紧，可以关掉 `debug`，或把 `neural_fallback_traditional` 关掉省一次传统流程。
+- **数字偶尔跳**（比如 3/4 之间跳）：tracker 是按 `number` 匹配的，跳变会导致重新锁定；先调高置信度阈值，编号映射表在 `neural_detector.cpp` 的 `kGenres`。
+- **帧率掉 / 到 NX 上卡**：神经网络每帧约 11ms 是 onnxruntime **CPU 版**跑出来的，GPU 一点没用上。真正的提速手段是换 GPU 推理（OpenVINO GPU 或 TensorRT），不是继续抠预处理或传统那 1ms。相机源的解码开销在实车上不存在（实车是相机驱动直接出图），离线回放视频会额外吃掉一些帧率。
 - **模型只在它训练过的场地最稳**：深大模型和曝光/增益强相关（官方建议低曝光、高增益），实车务必按队里的曝光重新确认阈值。
 - **rqt 窗口弹不出来，报 `Could not find Qt binding ... No module named 'PyQt5'`**：`rqt_image_view` 的 shebang 是 `/usr/bin/env python3`，而 PATH 最前面挂的不是系统 python（本机是 `~/.platformio/penv/bin/python3`），那个环境里没有 PyQt5。`armor_video_launch.py` 已经给看图进程单独把 `/usr/bin` 放到 PATH 最前面，直接用 launch 不受影响；手工起的时候写成
   `PATH=/usr/bin:$PATH ros2 run rqt_image_view rqt_image_view /detector/result_img` 即可。
+
+## 9. 为什么不做传统角点精修（同行调研）
+
+| 队伍/项目 | 识别 | 角点优化 | 推理后端 |
+| --- | --- | --- | --- |
+| [同济 SuperPower sp_vision_25](https://github.com/TongjiSuperPower/sp_vision_25) | 25 赛季由传统图像处理换成 NN 四点模型（readme 原话） | 写了 `lightbar_points_corrector`（PCA 回归角点，注明参考中南 FYT），但调用处注释为 **`//关闭PCA`** | OpenVINO，NUC12WSKI7，支持 GPU / async 推理 |
+| [南理工 Alliance rmcs_auto_aim_v2](https://github.com/Alliance-Algorithm/rmcs_auto_aim_v2) | NN 四点模型（深大 0526/0708、同济 yolov5 都支持） | 有 `optimize_corners`（ROI 端点优化），但两个入口都是 **`return; // @FIXME:`** | OpenVINO（PPP 做预处理），yaw 用牛顿迭代优化 |
+| [中南 FYT2024_vision](https://github.com/CSU-FYT-Vision/FYT2024_vision) | 传统 + 角点修正 | 这套算法的出处：ROI = 灯条外接矩形 +7%，通道差分图 → PCA 求对称轴 → 沿轴在 [0.4L,0.6L] 找亮度梯度最大点（Apache-2.0） | — |
+| [深大 RobotPilots](https://github.com/broalantaps/RobotDetectionModel) | 模型直接出四点 + 颜色 + 编号 | 无 | OpenVINO（iGPU），纯推理约 100FPS |
+| [K-Vision](https://github.com/Kielas520/K-Vision)（关键点训练框架） | 关键点头用 DFL 分布回归（积分求期望 → 天然亚像素），关键点距离 NMS | 无。FAQ“推理卡顿如何优化”的答案是换 GPU 推理、降输入分辨率 | ONNX Runtime (CUDA) |
+| [华北理工 HORIZON TRTInferX](https://github.com/BreCaspian/TRTInferX) | YOLOv11 | 无 | 预处理（letterbox/normalize）与 decode+NMS 全在 CUDA/TRT，相机零拷贝 GPU 输入，INT8 300+FPS |
+
+要点：
+
+1. **主流就是"网络四点 → PnP → yaw 优化 → EKF"，不做 CPU 侧的传统精修**；两支强队把角点修正代码写好了又关掉。
+2. **贵从来不是"端点优化"本身**（FYT 那套 ROI 只有灯条大小，0.1~0.3ms），贵的是它前面"全图二值化 + 轮廓 + PCA"那一整套。
+3. 关掉精修后精度靠四样东西兜：模型关键点质量（DFL/heatmap 亚像素、输入分辨率、bloom/遮挡数据增强）、yaw 重投影优化（微秒级，我们已有）、多帧 EKF（我们已有）、火控门限与延迟补偿。
+4. CPU 弱 + GPU 强的正解是**把预处理/推理/后处理搬到 GPU**（OpenVINO GPU / TensorRT + CUDA 预处理 + 引擎内 NMS），CPU 只留 PnP。
+5. 如果实车发现远距离角点跳动，处理顺序：①提高输入分辨率/换模型 → ②用 DFL 亚像素关键点重训 → ③最后才抄 FYT 的 ROI 版端点优化（`neural_refine_with_traditional` 开关就是留给这一步的）。

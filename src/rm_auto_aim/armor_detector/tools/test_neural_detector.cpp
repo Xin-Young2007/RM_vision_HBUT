@@ -78,10 +78,11 @@ int main(int argc, char ** argv)
 {
   if (argc < 2) {
     std::printf(
-      "用法: %s <图片或视频> [模型路径] [输出路径] [--red]\n"
+      "用法: %s <图片或视频> [模型路径] [输出路径] [--red] [--refine]\n"
       "  模型路径留空时用 model/shenzhen-0526.onnx\n"
       "  输出路径留空时: 图片存 <输入>_nn.jpg，视频存 <输入>_nn.avi\n"
-      "  --red 只识别红方（默认只识别蓝方）\n",
+      "  --red    只识别红方（默认只识别蓝方）\n"
+      "  --refine 额外跑一遍传统找灯条做角点精修，用来对比角点（默认不跑，和运行时一致）\n",
       argv[0]);
     return 1;
   }
@@ -90,10 +91,13 @@ int main(int argc, char ** argv)
   std::string model_path;
   std::string output_path;
   int detect_color = rm_auto_aim::BLUE;
+  bool refine = false;
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--red") {
       detect_color = rm_auto_aim::RED;
+    } else if (arg == "--refine") {
+      refine = true;
     } else if (model_path.empty()) {
       model_path = arg;
     } else {
@@ -128,14 +132,26 @@ int main(int argc, char ** argv)
     cv::Mat rgb;
     cv::cvtColor(first, rgb, cv::COLOR_BGR2RGB);
 
-    auto binary = traditional.preprocessImage(rgb);
-    auto lights = traditional.findLights(rgb, binary, traditional.gray_img);
     auto armors = neural->detect(rgb);
-    const int refined = rm_auto_aim::refineArmorCorners(armors, lights, refine_params);
+    int refined = 0;
+    size_t light_count = 0;
+    if (refine) {
+      // 只有显式加 --refine 才跑传统找灯条 + 角点精修（默认和运行时一致：纯网络四点）
+      auto binary = traditional.preprocessImage(rgb);
+      auto lights = traditional.findLights(rgb, binary, traditional.gray_img);
+      light_count = lights.size();
+      refined = rm_auto_aim::refineArmorCorners(armors, lights, refine_params);
+    }
 
-    std::printf(
-      "图片 %s: 传统灯条 %zu 个, 神经网络 %.1fms, 检出 %zu 个装甲板, 融合微调 %d 个\n",
-      input_path.c_str(), lights.size(), neural->lastLatencyMs(), armors.size(), refined);
+    if (refine) {
+      std::printf(
+        "图片 %s: 神经网络 %.1fms, 传统灯条 %zu 个, 检出 %zu 个装甲板, 精修 %d 个\n",
+        input_path.c_str(), neural->lastLatencyMs(), light_count, armors.size(), refined);
+    } else {
+      std::printf(
+        "图片 %s: 神经网络 %.1fms, 检出 %zu 个装甲板（纯网络四点，无传统精修）\n",
+        input_path.c_str(), neural->lastLatencyMs(), armors.size());
+    }
     printArmors(armors);
 
     cv::Mat vis = first.clone();
@@ -169,10 +185,12 @@ int main(int argc, char ** argv)
     cv::Mat rgb;
     cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
 
-    auto binary = traditional.preprocessImage(rgb);
-    auto lights = traditional.findLights(rgb, binary, traditional.gray_img);
     auto armors = neural->detect(rgb);
-    rm_auto_aim::refineArmorCorners(armors, lights, refine_params);
+    if (refine) {
+      auto binary = traditional.preprocessImage(rgb);
+      auto lights = traditional.findLights(rgb, binary, traditional.gray_img);
+      rm_auto_aim::refineArmorCorners(armors, lights, refine_params);
+    }
 
     ++frames;
     total_nn_ms += neural->lastLatencyMs();
@@ -186,9 +204,10 @@ int main(int argc, char ** argv)
   }
 
   std::printf(
-    "视频 %s: %d 帧, 有检出的帧 %d, 装甲板总计 %d, 平均推理 %.1fms (约 %.1f FPS)\n",
+    "视频 %s: %d 帧, 有检出的帧 %d, 装甲板总计 %d, 平均推理 %.1fms (%.1f FPS)%s\n",
     input_path.c_str(), frames, frames_with_armor, total_armors,
-    frames > 0 ? total_nn_ms / frames : 0.0, frames > 0 ? 1000.0 * frames / total_nn_ms : 0.0);
+    frames > 0 ? total_nn_ms / frames : 0.0, frames > 0 ? 1000.0 * frames / total_nn_ms : 0.0,
+    refine ? "（含传统精修）" : "（纯网络四点）");
   std::printf("  结果视频: %s\n", output.c_str());
   return 0;
 }

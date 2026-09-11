@@ -288,8 +288,17 @@ namespace rm_auto_aim
         neural_params_.nms_threshold =
             static_cast<float>(declare_parameter("neural_nms_threshold", 0.45, conf_desc));
         neural_params_.swap_color = declare_parameter("neural_swap_color", false);
-        neural_refine_ = declare_parameter("neural_refine_with_traditional", true);
-        neural_fallback_ = declare_parameter("neural_fallback_traditional", true);
+
+        rcl_interfaces::msg::ParameterDescriptor refine_desc;
+        refine_desc.description =
+            "是否用传统灯条对网络角点做局部精修。默认 false：网络四点直接进 PnP（同济/南理工/深大都是这个路子），"
+            "打开后每帧会多跑一遍传统找灯条（CPU 约 8~10ms），只在需要对比角点精度时用";
+        neural_refine_ = declare_parameter("neural_refine_with_traditional", false, refine_desc);
+
+        rcl_interfaces::msg::ParameterDescriptor fallback_desc;
+        fallback_desc.description =
+            "神经网络这一帧没用（没检出/推理失败）时，本帧退回传统识别兜底。默认 true";
+        neural_fallback_ = declare_parameter("neural_fallback_traditional", true, fallback_desc);
 
         RCLCPP_INFO(
             this->get_logger(), "检测模式: %s（切到神经网络: ros2 param set %s detector_mode neural）",
@@ -355,22 +364,11 @@ namespace rm_auto_aim
 
     std::vector<Armor> ArmorDetectorNode::detectArmorsByNeural(const cv::Mat& img, bool& traditional_ran)
     {
-        // 模型用不了就直接走传统流程，保证车还能打
+        // 模型加载不了（文件缺失/没有 onnxruntime）：整场退回传统识别，保证车还能打
         if (!ensureNeuralDetector())
         {
             traditional_ran = true;
             return detector_->detect(img);
-        }
-
-        // 传统流程这一帧也跑一遍：一是给融合提供亚像素灯条角点，
-        // 二是神经网络漏检时可以整帧退回传统结果
-        std::vector<Light> lights;
-        if (neural_refine_ || neural_fallback_)
-        {
-            auto binary_img = detector_->preprocessImage(img);
-            lights = detector_->findLights(img, binary_img, detector_->gray_img);
-            detector_->debug_armors.data.clear();
-            traditional_ran = true;
         }
 
         // 同步一次可以在线改的参数
@@ -383,34 +381,52 @@ namespace rm_auto_aim
         neural_params_.swap_color = get_parameter("neural_swap_color").as_bool();
         neural_detector_->setParams(neural_params_);
 
+        // 1) 神经网络四点直接拿来用：四点 → PnP → yaw 优化 → tracker(EKF)，这一帧不跑传统视觉。
+        //    同济 sp_vision_25、南理工 Alliance、深大都是这个路子（不做传统角点精修）。
         std::vector<Armor> armors;
+        bool nn_ok = true;
         try
         {
             armors = neural_detector_->detect(img);
         }
         catch (const std::exception& e)
         {
+            nn_ok = false;
             RCLCPP_ERROR_THROTTLE(
                 this->get_logger(), *this->get_clock(), 2000, "神经网络推理异常：%s", e.what());
+        }
+
+        // 2) 可选（默认关）：想对比"网络角点 vs 传统灯条精修角点"时才打开
+        if (neural_refine_ && nn_ok && !armors.empty())
+        {
+            auto binary_img = detector_->preprocessImage(img);
+            auto lights = detector_->findLights(img, binary_img, detector_->gray_img);
+            detector_->debug_armors.data.clear();
+            traditional_ran = true;
+            if (!lights.empty())
+            {
+                refineArmorCorners(armors, lights, RefineParams{});
+            }
+        }
+
+        // 3) 兜底：神经网络这一帧没用（没检出/推理失败）才跑传统识别
+        if ((!nn_ok || armors.empty()) && neural_fallback_)
+        {
+            ++nn_fallback_frames_;
+            // 连续兜底说明模型这场景不好使了，提示一下，别让人以为还在用网络
+            if (nn_fallback_frames_ == 1 || nn_fallback_frames_ % 60 == 0)
+            {
+                RCLCPP_WARN(
+                    this->get_logger(), "神经网络连续 %d 帧没有可用结果，这几帧用传统识别兜底",
+                    nn_fallback_frames_);
+            }
             traditional_ran = true;
             return detector_->detect(img);
         }
-
-        // 融合：神经网络负责“是什么”（类别、颜色、候选框），
-        // 传统视觉负责“在哪”（灯条 PCA 亚像素角点），两者取长补短
-        if (neural_refine_ && !armors.empty() && !lights.empty())
-        {
-            refineArmorCorners(armors, lights, RefineParams{});
-        }
-
-        if (armors.empty() && neural_fallback_)
-        {
-            traditional_ran = true;
-            return detector_->detect(img);
-        }
+        nn_fallback_frames_ = 0;
 
         // number_img 只给 /detector/number_img 调试用，不影响识别结果
-        if (!armors.empty())
+        if (!armors.empty() && debug_)
         {
             detector_->classifier->extractNumbers(img, armors);
         }

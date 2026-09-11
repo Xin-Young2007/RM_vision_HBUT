@@ -73,9 +73,13 @@ private:
   std::unique_ptr<NeuralDetector> neural_detector_;
   std::atomic<bool> neural_load_failed_{false};
   NeuralDetectorParams neural_params_;
-  bool neural_refine_ = true;      // 用传统灯条微调 CNN 角点
-  bool neural_fallback_ = true;    // CNN 没检出时退回传统流程
+  // （默认关）用传统灯条对网络角点做局部精修，只在需要对比精度时打开
+  bool neural_refine_ = false;
+  // 神经网络这一帧没用（没检出/推理失败）时，本帧退回传统识别兜底
+  bool neural_fallback_ = true;
   std::string neural_model_path_;
+  // 神经网络连续多少帧没给出可用结果（用来提示"正在用传统兜底"）
+  int nn_fallback_frames_ = 0;
   // 本帧是否跑过传统流程（决定 debug 里的二值图/灯条信息是不是这一帧的）
   bool traditional_ran_ = false;
 

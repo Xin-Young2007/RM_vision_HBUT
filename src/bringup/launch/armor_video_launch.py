@@ -58,6 +58,10 @@ def generate_launch_description():
             'neural_conf_threshold', default_value='0.65',
             description='神经网络置信度阈值（仅 neural 模式生效）'),
         DeclareLaunchArgument(
+            'neural_refine', default_value='false',
+            description='是否额外跑传统找灯条做角点精修；默认 false=网络四点直接进 PnP，'
+                        '打开只用于对比角点精度'),
+        DeclareLaunchArgument(
             'use_tf', default_value='true',
             description='发 odom→camera_optical_frame 静态 TF；离线没有云台 TF，不发的话 PnP 出不了位姿'),
         DeclareLaunchArgument(
@@ -120,6 +124,7 @@ def launch_setup(context, *args, **kwargs):
         'binary_thres': arg_int('binary_thres'),
         'detector_mode': detector_mode,
         'neural_conf_threshold': arg_float('neural_conf_threshold'),
+        'neural_refine_with_traditional': arg_bool('neural_refine'),
     })
 
     # 视频和检测放同一个容器，进程内零拷贝传图（和 armor_launch.py 里 video_detector_container 一样）
