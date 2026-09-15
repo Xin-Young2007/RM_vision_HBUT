@@ -65,12 +65,17 @@ private:
 		cap_ >> frame;
 		if (frame.empty())
 		{
-			RCLCPP_ERROR(this->get_logger(), "frame is empty");
+			// 视频文件不存在 / 播到头：报错并重开一次；仍然拿不到就跳过这一帧。
+			// 空帧绝对不能进 cvtColor，否则抛异常会把整个 component 容器带崩。
+			RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 3000, "frame is empty");
 			cap_.release();
 			auto pkg_path = ament_index_cpp::get_package_share_directory("video_pub");
 			cap_ = cv::VideoCapture(pkg_path + "/video/"  + video_path_);
 			cap_ >> frame;
-			// return;
+			if (frame.empty())
+			{
+				return;
+			}
 		}
 		cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
 		auto image_msg_ = cv_bridge::CvImage(std_msgs::msg::Header(), "rgb8", frame).toImageMsg();

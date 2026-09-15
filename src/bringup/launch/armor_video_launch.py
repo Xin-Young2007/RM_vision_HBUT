@@ -68,8 +68,8 @@ def generate_launch_description():
             'use_tracker', default_value='false',
             description='同时起 armor_tracker，看能不能锁上'),
         DeclareLaunchArgument(
-            'rqt', default_value='true',
-            description='自动打开 rqt_image_view 看 /detector/result_img'),
+            'rqt', default_value='true' if os.environ.get('DISPLAY') else 'false',
+            description='自动打开 rqt_image_view 看 /detector/result_img（没有 DISPLAY 时默认不开）'),
     ]
 
     return LaunchDescription(declared_arguments + [OpaqueFunction(function=launch_setup)])
@@ -159,12 +159,20 @@ def launch_setup(context, *args, **kwargs):
     )
     actions.append(detector_container)
 
-    # 离线没有云台/雷达，补一个静态 TF，PnP 才有位姿可发
+    # 离线没有云台/雷达，补一个静态 TF，PnP 才有位姿可发。
+    # 注意参数格式各版本不一样：Foxy 及更早是 9 个位置参数
+    #   x y z yaw pitch roll frame_id child_frame_id
+    # Galactic/Humble 以后才支持 --frame-id / --child-frame-id 这种写法。
+    distro = os.environ.get('ROS_DISTRO', '')
+    if distro in ('dashing', 'eloquent', 'foxy'):
+        tf_args = ['0', '0', '0', '0', '0', '0', 'odom', 'camera_optical_frame']
+    else:
+        tf_args = ['--frame-id', 'odom', '--child-frame-id', 'camera_optical_frame']
     actions.append(Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='armor_video_static_tf',
-        arguments=['--frame-id', 'odom', '--child-frame-id', 'camera_optical_frame'],
+        arguments=tf_args,
         condition=IfCondition(arg('use_tf')),
         output='log',
     ))
@@ -194,6 +202,11 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(arg('rqt')),
         output='log',
     )]))
+    if arg_bool('rqt') and not os.environ.get('DISPLAY'):
+        actions.append(LogInfo(msg=(
+            '[armor_video] 当前没有 DISPLAY（SSH 进来的时候），看图窗口会起不来；'
+            '想看画面就在有桌面的机器上用 rqt_image_view 订阅 /detector/result_img，'
+            '或者加 rqt:=false 直接跑。')))
 
     actions.append(LogInfo(msg=(
         f'[armor_video] 视频={video_name} 颜色={"红" if detect_color == 1 else "蓝"} '
